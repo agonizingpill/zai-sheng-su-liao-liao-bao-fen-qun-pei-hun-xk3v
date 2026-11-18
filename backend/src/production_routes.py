@@ -3,8 +3,8 @@ from sqlalchemy import select
 from .database import Session
 from .security import current,allow
 from .blending import obj,audit
-from .production_models import Dryer,DryingRun,PelletPack,BlendShipment
-from .production_schemas import DryerInput,DryingInput,DryingMeasure,PackInput,PackWeight,ShipmentInput,LoadPack,ShipmentReceipt
+from .production_models import Dryer,DryingRun,DryerMigration,PelletPack,BlendShipment
+from .production_schemas import DryerInput,DryingInput,DryingMeasure,MigrationInput,PackInput,PackWeight,ShipmentInput,LoadPack,ShipmentReceipt
 from . import production_service as svc
 router=APIRouter()
 @router.get('/dryers')
@@ -30,6 +30,17 @@ def measure(id:int,p:DryingMeasure,u=Depends(current)):
 def accept(id:int,u=Depends(current)):
     allow(u,'admin')
     with Session.begin()as s:return svc.accept_dry(s,id,u)
+@router.get('/dryer-migrations')
+def migrations(u=Depends(current)):
+    with Session()as s:return [svc.migration_view(s,x)for x in s.scalars(select(DryerMigration).order_by(DryerMigration.id.desc()))]
+@router.post('/dryer-migrations')
+def plan(p:MigrationInput,u=Depends(current)):
+    allow(u,'admin')
+    with Session.begin()as s:return svc.plan_migration(s,p,u)
+@router.post('/dryer-migrations/{id}/confirm')
+def confirm(id:int,u=Depends(current)):
+    allow(u,'admin')
+    with Session.begin()as s:return svc.confirm_migration(s,id,u)
 @router.get('/pellet-packs')
 def packs(u=Depends(current)):
     with Session()as s:return [svc.pack_view(s,x)for x in s.scalars(select(PelletPack).order_by(PelletPack.id.desc()))]

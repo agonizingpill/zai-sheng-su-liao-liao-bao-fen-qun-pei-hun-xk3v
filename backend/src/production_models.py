@@ -20,6 +20,19 @@ class DryingRun(Base):
     measurements:Mapped[list]=mapped_column(JSON)
     input_snapshot:Mapped[dict]=mapped_column(JSON)
     accepted_by:Mapped[str|None]=mapped_column(String(120),nullable=True)
+class DryerMigration(Base):
+    __tablename__='dryer_migrations'
+    id:Mapped[int]=mapped_column(primary_key=True)
+    code:Mapped[str]=mapped_column(String(40),unique=True)
+    dryer_id:Mapped[int]=mapped_column(ForeignKey('dryers.id'))
+    deadline:Mapped[str]=mapped_column(String(40))
+    state:Mapped[str]=mapped_column(String(20),default='planned')
+    moves:Mapped[list]=mapped_column(JSON)
+    snapshot:Mapped[dict]=mapped_column(JSON)
+    created_by:Mapped[str]=mapped_column(String(120))
+    created_at:Mapped[str]=mapped_column(String(40))
+    confirmed_by:Mapped[str|None]=mapped_column(String(120),nullable=True)
+    confirmed_at:Mapped[str|None]=mapped_column(String(40),nullable=True)
 class PelletPack(Base):
     __tablename__='pellet_packs'
     __table_args__=(CheckConstraint('kg > 0'),)

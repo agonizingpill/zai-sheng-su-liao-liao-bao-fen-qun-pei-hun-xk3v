@@ -12,6 +12,9 @@ class DryingMeasure(Clean):
     after_moisture:Decimal=Field(ge=0,le=100,max_digits=9,decimal_places=4)
     ends_at:datetime
     note:str=Field(min_length=8,max_length=600)
+class MigrationInput(Clean):
+    dryer_id:int=Field(gt=0)
+    deadline:datetime
 class PackInput(Clean):
     check_id:int=Field(gt=0)
     code:str=Field(min_length=2,max_length=80)

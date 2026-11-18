@@ -6,7 +6,7 @@ from sqlalchemy import select,func
 from .database import Session
 from .models import Blend
 from .quality_models import PelletCheck
-from .production_models import Dryer,DryingRun,PelletPack,BlendShipment,ShipmentPack
+from .production_models import Dryer,DryingRun,DryerMigration,PelletPack,BlendShipment,ShipmentPack
 from .blending import obj,get,audit,view
 
 def stamp(v):return (v.replace(tzinfo=ZoneInfo('Asia/Shanghai'))if v.tzinfo is None else v).astimezone(timezone.utc)
@@ -48,6 +48,69 @@ def accepted_drying(s,blend_id):
     x=s.scalar(select(DryingRun).where(DryingRun.blend_id==blend_id,DryingRun.state=='accepted'))
     if not x:raise HTTPException(409,'成品新签证须有同配方主管验收合格的烘干作业')
     return dry_view(s,x)
+def occ_view(s,dryer):return [{'run_id':x.id,'blend_code':s.get(Blend,x.blend_id).code,'state':x.state,'starts_at':x.starts_at,'ends_at':x.ends_at}for x in s.scalars(select(DryingRun).where(DryingRun.dryer_id==dryer.id).order_by(DryingRun.starts_at,DryingRun.id))]
+def migration_view(s,x):
+    d=obj(x);d['dryer_code']=s.get(Dryer,x.dryer_id).code;moves=[]
+    for m in x.moves:
+        r=s.get(DryingRun,m['run_id'])
+        moves.append({**m,'current_state':r.state,'current_dryer_code':s.get(Dryer,r.dryer_id).code,'current_starts_at':r.starts_at,'current_ends_at':r.ends_at})
+    d['moves']=moves;return d
+def earliest(busy,anchor,duration,deadline):
+    t=anchor
+    for s0,e0 in sorted(busy):
+        if e0<=t:continue
+        if s0<t+duration:t=e0
+    return t if t+duration<=deadline else None
+def plan_migration(s,p,u):
+    dryer=get(s,Dryer,p.dryer_id,True)
+    if dryer.state!='active':raise HTTPException(409,'设备已停用，未验收作业已整批迁出，没有可试排的排程')
+    deadline=stamp(p.deadline)
+    batch=[x for x in s.scalars(select(DryingRun).where(DryingRun.dryer_id==dryer.id).order_by(DryingRun.starts_at,DryingRun.id))if x.state!='accepted']
+    if not batch:raise HTTPException(409,'该机没有未验收烘干作业，已验收作业留在原机，无需迁移')
+    targets=[d for d in s.scalars(select(Dryer).where(Dryer.state=='active',Dryer.id!=dryer.id).order_by(Dryer.id))]
+    if not targets:raise HTTPException(409,'没有其他可用烘干设备，整批无法迁移')
+    busy={d.id:[(datetime.fromisoformat(x.starts_at),datetime.fromisoformat(x.ends_at))for x in s.scalars(select(DryingRun).where(DryingRun.dryer_id==d.id))]for d in targets}
+    moves=[]
+    for x in batch:
+        start,end=datetime.fromisoformat(x.starts_at),datetime.fromisoformat(x.ends_at);duration=end-start;best=None
+        for d in targets:
+            t=earliest(busy[d.id],start,duration,deadline)
+            if t is not None and(best is None or t<best[0]):best=(t,d)
+        if best is None:raise HTTPException(409,f'复产期限内排不下：{s.get(Blend,x.blend_id).code} 按原时长{duration}在其他设备均与既有占用冲突或超期限，整批方案已拒绝')
+        t,d=best;busy[d.id].append((t,t+duration))
+        moves.append({'run_id':x.id,'blend_id':x.blend_id,'blend_code':s.get(Blend,x.blend_id).code,'from_dryer_id':dryer.id,'from_dryer_code':dryer.code,'from_starts_at':x.starts_at,'from_ends_at':x.ends_at,'to_dryer_id':d.id,'to_dryer_code':d.code,'to_starts_at':t.isoformat(),'to_ends_at':(t+duration).isoformat(),'duration_hours':duration.total_seconds()/3600,'state_at_plan':x.state,'input_moisture':float(x.input_moisture),'measurements':x.measurements,'input_snapshot':x.input_snapshot})
+    snapshot={'dryer_code':dryer.code,'deadline':deadline.isoformat(),'source_occupancy':occ_view(s,dryer),'target_occupancy':{d.code:occ_view(s,d)for d in targets},'at':now()}
+    x=DryerMigration(code='',dryer_id=dryer.id,deadline=deadline.isoformat(),state='planned',moves=moves,snapshot=snapshot,created_by=u['email'],created_at=now());s.add(x);s.flush();x.code=f'DM-{x.id:06d}'
+    audit(s,u,'migration_planned',x.code+' / '+dryer.code+' / '+str(len(moves))+'单');return migration_view(s,x)
+def confirm_migration(s,id,u):
+    x=get(s,DryerMigration,id,True)
+    if x.state=='confirmed':return migration_view(s,x)
+    moves=x.moves;planned={m['run_id']for m in moves}
+    dryer_ids=sorted({x.dryer_id}|{m['to_dryer_id']for m in moves})
+    dryers={d.id:d for d in s.scalars(select(Dryer).where(Dryer.id.in_(dryer_ids)).order_by(Dryer.id).with_for_update().execution_options(populate_existing=True))}
+    dryer=dryers[x.dryer_id]
+    if dryer.state!='active':raise HTTPException(409,'原设备已停用，方案不可重复迁移')
+    runs={r.id:r for r in s.scalars(select(DryingRun).where(DryingRun.dryer_id.in_(dryer_ids)).with_for_update().execution_options(populate_existing=True))}
+    stale=[]
+    for r in runs.values():
+        if r.dryer_id==x.dryer_id and r.id in planned and r.state=='accepted':stale.append(f'{s.get(Blend,r.blend_id).code} 已被主管验收，应留原机')
+    extra=[r for r in runs.values()if r.dryer_id==x.dryer_id and r.state!='accepted'and r.id not in planned]
+    if extra:stale.append('原机有未纳入方案的新开作业：'+'、'.join(sorted(s.get(Blend,r.blend_id).code for r in extra)))
+    for m in moves:
+        r=runs.get(m['run_id'])
+        if r is None or r.dryer_id!=x.dryer_id:stale.append(f'{m["blend_code"]} 已不在原机排程');continue
+        if r.starts_at!=m['from_starts_at']or r.ends_at!=m['from_ends_at']:stale.append(f'{m["blend_code"]} 原时段已延烘或改期')
+    for m in moves:
+        if dryers[m['to_dryer_id']].state!='active':stale.append(f'目标设备{dryers[m["to_dryer_id"]].code}已停用')
+    for m in moves:
+        ns,ne=datetime.fromisoformat(m['to_starts_at']),datetime.fromisoformat(m['to_ends_at'])
+        for r in runs.values():
+            if r.id not in planned and r.dryer_id==m['to_dryer_id']and datetime.fromisoformat(r.starts_at)<ne and datetime.fromisoformat(r.ends_at)>ns:stale.append(f'{m["blend_code"]} 的新时段在{dryers[m["to_dryer_id"]].code}与{s.get(Blend,r.blend_id).code}冲突')
+    if stale:raise HTTPException(409,'方案已过期，整批拒绝：'+'；'.join(dict.fromkeys(stale)))
+    for m in moves:
+        r=runs[m['run_id']];r.dryer_id=m['to_dryer_id'];r.starts_at=m['to_starts_at'];r.ends_at=m['to_ends_at'];r.after_moisture=None;r.state='drying'
+    dryer.state='down';x.state='confirmed';x.confirmed_by=u['email'];x.confirmed_at=now()
+    audit(s,u,'migration_confirmed',x.code+' / '+dryer.code+' / '+str(len(moves))+'单');return migration_view(s,x)
 def available_pack_weight(s,p,kg,exclude=None):
     used=sum((x.kg for x in s.scalars(select(PelletPack).where(PelletPack.check_id==p.id,PelletPack.state!='cancelled').with_for_update().execution_options(populate_existing=True))if x.id!=exclude),Decimal(0))
     if used+kg>p.actual_kg:raise HTTPException(409,'累计有效包装重量超过合格粒料产出，不分配超额箱码')
